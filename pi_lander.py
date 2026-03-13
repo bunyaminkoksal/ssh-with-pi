@@ -366,17 +366,32 @@ class PerfectLanderPX4:
 
     def takeoff(self, altitude_m=TAKEOFF_ALT_M):
         """
-        PX4 takeoff komutu.
-        ARM durumunda olmalı, değilse reddeder.
-        MAV_CMD_NAV_TAKEOFF gönderir.
+        Tam otomatik takeoff sekansı:
+        1. Offboard warmup (setpoint stream)
+        2. OFFBOARD moda geçiş
+        3. ARM
+        4. MAV_CMD_NAV_TAKEOFF gönder
         """
-        if not self.is_armed:
-            self.log("TAKEOFF REDDEDILDI: arac arm degil! Once ARM yapin.")
-            return
-
         try:
-            self.log(f"takeoff komutu gonderiliyor: {altitude_m:.1f}m")
+            self.state = "TAKEOFF"
+            self.log(f"takeoff sekans basliyor: hedef {altitude_m:.1f}m")
 
+            # 1) Offboard warmup — PX4 offboard geçmeden önce
+            #    setpoint akışı istiyor
+            self.warmup_offboard_stream()
+
+            # 2) OFFBOARD moda geç
+            self.request_offboard_mode()
+            time.sleep(0.3)
+
+            # 3) ARM
+            if not self.is_armed:
+                self.arm_vehicle()
+                # ARM'ın kabul edilmesi için kısa bekleme
+                time.sleep(1.0)
+
+            # 4) Takeoff komutu gönder
+            self.log(f"MAV_CMD_NAV_TAKEOFF gonderiliyor: {altitude_m:.1f}m")
             self.master.mav.command_long_send(
                 self.master.target_system,
                 self.master.target_component,
@@ -391,7 +406,6 @@ class PerfectLanderPX4:
                 float(altitude_m)  # param7: altitude
             )
 
-            self.state = "TAKEOFF"
             self.log(f"takeoff baslatildi -> {altitude_m:.1f}m")
         except Exception as e:
             self.log(f"takeoff hata: {e}")
