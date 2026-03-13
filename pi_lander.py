@@ -366,49 +366,71 @@ class PerfectLanderPX4:
 
     def takeoff(self, altitude_m=TAKEOFF_ALT_M):
         """
-        Tam otomatik takeoff sekansı:
+        Tam otomatik takeoff sekansı (ayrı thread'de çalışır):
         1. Offboard warmup (setpoint stream)
         2. OFFBOARD moda geçiş
-        3. ARM
-        4. MAV_CMD_NAV_TAKEOFF gönder
+        3. ARM (bekleme döngüsü ile)
+        4. OFFBOARD velocity ile yükselme
         """
+        # Ayrı thread'de çalıştır — komut dinleyiciyi bloklamasın
+        t = threading.Thread(target=self._takeoff_sequence, args=(altitude_m,), daemon=True)
+        t.start()
+
+    def _takeoff_sequence(self, altitude_m):
+        """Takeoff sekansının asıl implementasyonu."""
         try:
             self.state = "TAKEOFF"
             self.log(f"takeoff sekans basliyor: hedef {altitude_m:.1f}m")
 
-            # 1) Offboard warmup — PX4 offboard geçmeden önce
-            #    setpoint akışı istiyor
+            # 1) Offboard warmup — PX4 offboard moduna geçmeden önce
+            #    minimum ~1 saniye setpoint akışı istiyor
             self.warmup_offboard_stream()
 
             # 2) OFFBOARD moda geç
             self.request_offboard_mode()
-            time.sleep(0.3)
+            time.sleep(0.5)
 
-            # 3) ARM
+            # 3) ARM — onay döngüsü ile
             if not self.is_armed:
                 self.arm_vehicle()
-                # ARM'ın kabul edilmesi için kısa bekleme
-                time.sleep(1.0)
+                self.log("ARM bekleniyor...")
+                t_start = time.time()
+                while not self.is_armed and (time.time() - t_start) < 4.0:
+                    # Setpoint akışını devam ettir yoksa PX4
+                    # offboard'dan çıkar
+                    self.send_body_velocity(0.0, 0.0, 0.0)
+                    time.sleep(0.1)
 
-            # 4) Takeoff komutu gönder
-            self.log(f"MAV_CMD_NAV_TAKEOFF gonderiliyor: {altitude_m:.1f}m")
-            self.master.mav.command_long_send(
-                self.master.target_system,
-                self.master.target_component,
-                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                0,            # confirmation
-                0,            # param1: pitch (ignored by PX4)
-                0,            # param2: empty
-                0,            # param3: empty
-                0,            # param4: yaw (NaN = current)
-                0,            # param5: lat (ignored, local)
-                0,            # param6: lon (ignored, local)
-                float(altitude_m)  # param7: altitude
-            )
+                if not self.is_armed:
+                    self.log("TAKEOFF BASARISIZ: ARM kabul edilmedi!")
+                    self.state = "IDLE"
+                    return
 
-            self.log(f"takeoff baslatildi -> {altitude_m:.1f}m")
+            self.log("ARM onaylandi!")
+
+            # 4) OFFBOARD velocity ile yükselme
+            #    NED frame: vz negatif = yukarı
+            climb_speed = 0.5   # m/s yukarı
+            climb_time = altitude_m / climb_speed
+
+            self.log(f"yukselme basliyor: {climb_speed:.1f} m/s, sure: {climb_time:.1f}s")
+
+            # auto_enabled'ı aç — setpoint_sender_loop
+            # cmd velocity'yi göndersin
+            self.auto_enabled = True
+            self.manual_override = False
+            self.set_commanded_velocity(0.0, 0.0, -climb_speed)
+
+            time.sleep(climb_time)
+
+            # 5) Hover — yerinde dur
+            self.set_commanded_velocity(0.0, 0.0, 0.0)
+            self.state = "HOVER"
+            self.log(f"takeoff tamamlandi: {altitude_m:.1f}m")
+
         except Exception as e:
             self.log(f"takeoff hata: {e}")
+            self.state = "IDLE"
 
     def land(self):
         """
