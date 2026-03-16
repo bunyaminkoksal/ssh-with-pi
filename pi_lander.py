@@ -93,6 +93,51 @@ SEND_ZERO_ON_IDLE = True
 # ---------- Takeoff ----------
 TAKEOFF_ALT_M = 1.0
 
+# ==========================================================
+# PRECISION LANDING PARAMETRELERI
+# ==========================================================
+
+# ---------- Multi-Marker Layout ----------
+# ID=0: merkez büyük marker (coarse), ID=1..4: köşe küçük markerlar (fine)
+CORNER_IDS = [1, 2, 3, 4]
+CENTER_MARKER_SIZE = MARKER_SIZE_M   # ID=0 boyutu (metre)
+CORNER_MARKER_SIZE = 0.05            # ID=1..4 boyutu (metre)
+CORNER_DX = 0.25                     # Merkezden köşe X mesafesi (metre)
+CORNER_DY = 0.25                     # Merkezden köşe Y mesafesi (metre)
+CORNER_BLEND_WEIGHT = 0.35           # Blend modunda köşe ağırlığı
+
+# ---------- Fine / Coarse mode ----------
+FINE_ENTER_ALT = 1.50   # Bu altında fine mode aktif
+FINE_EXIT_ALT  = 2.00   # Bu üstünde coarse'a dön (histerezis)
+
+# ---------- Lock mode ----------
+LOCK_ALT_M       = 3.00
+LOCK_ENTER_PX    = 120
+LOCK_EXIT_PX     = 160
+LOCK_YAW_ENTER   = 0.25   # rad
+LOCK_YAW_EXIT    = 0.35   # rad
+LOCK_VZ_DOWN     = 0.25   # m/s
+LOCK_KP_MULT     = 2.0
+LOCK_KD_MULT     = 2.0
+LOCK_DISABLE_INTEGRAL = True
+
+# ---------- Velocity taper ----------
+TAPER_BASE_FAR   = 250.0
+TAPER_BASE_NEAR  = 180.0
+TAPER_MIN_FAR    = 0.20
+TAPER_MIN_NEAR   = 0.12
+
+# ---------- Quintic trajectory ----------
+TRAJ_BASE_DURATION = 8.0   # saniye
+
+# ---------- Yaw PID ----------
+KP_YAW = 1.0
+
+# ---------- Precision kill ----------
+PRECISION_KILL_ALT  = 0.40   # m
+PRECISION_KILL_DIST = 120    # px
+BLIND_KILL_ALT      = 0.50   # m: marker kaybolursa bu altında kill
+
 
 # =========================================================
 # YARDIMCI
@@ -162,6 +207,7 @@ class PerfectLanderPX4:
         self.cmd_vx = 0.0
         self.cmd_vy = 0.0
         self.cmd_vz = 0.0
+        self.cmd_yaw_rate = 0.0
         self.cmd_lock = threading.Lock()
 
         # FPS
@@ -183,6 +229,44 @@ class PerfectLanderPX4:
             [ ms, -ms, 0.0],
             [-ms, -ms, 0.0]
         ], dtype=np.float32)
+
+        # köşe marker 3D noktaları
+        cs = CORNER_MARKER_SIZE / 2.0
+        self.marker_points_corner = np.array([
+            [-cs,  cs, 0.0],
+            [ cs,  cs, 0.0],
+            [ cs, -cs, 0.0],
+            [-cs, -cs, 0.0]
+        ], dtype=np.float32)
+
+        # Köşe markerdan platform merkezine offset vektörü (marker frame)
+        dx, dy = CORNER_DX, CORNER_DY
+        self.corner_offsets = {
+            1: np.array([+dx, -dy, 0.0], dtype=np.float32),  # sol-üst
+            2: np.array([-dx, -dy, 0.0], dtype=np.float32),  # sağ-üst
+            3: np.array([+dx, +dy, 0.0], dtype=np.float32),  # sol-alt
+            4: np.array([-dx, +dy, 0.0], dtype=np.float32),  # sağ-alt
+        }
+
+        # ---- Precision Landing durumu ----
+        self.precision_land_active = False
+        self.precision_state = "IDLE"   # SEARCH/COARSE/FINE/BLEND/LOCK/TRAJ/KILL
+        self.fine_mode = False
+        self.corner_count = 0
+        self.precision_blind = True
+        self.was_landing = False
+
+        # Quintic trajectory
+        self.traj_active = False
+        self.traj_start_time = 0.0
+        self.traj_start_alt = 0.0
+        self.traj_duration = TRAJ_BASE_DURATION
+
+        # Center-last tracking
+        self.last_seen_center_time = 0.0
+        self.last_seen_center_z = 999.0
+        self.precision_last_alt = 999.0
+        self.max_vel_precision = 0.80   # m/s precision landing max hiz
 
         # aruco detector
         if hasattr(aruco, "getPredefinedDictionary"):
@@ -534,15 +618,16 @@ class PerfectLanderPX4:
         except Exception as e:
             self.log(f"velocity send hata: {e}")
 
-    def set_commanded_velocity(self, vx, vy, vz):
+    def set_commanded_velocity(self, vx, vy, vz, yaw_rate=0.0):
         with self.cmd_lock:
             self.cmd_vx = float(vx)
             self.cmd_vy = float(vy)
             self.cmd_vz = float(vz)
+            self.cmd_yaw_rate = float(yaw_rate)
 
     def get_commanded_velocity(self):
         with self.cmd_lock:
-            return self.cmd_vx, self.cmd_vy, self.cmd_vz
+            return self.cmd_vx, self.cmd_vy, self.cmd_vz, self.cmd_yaw_rate
 
     def warmup_offboard_stream(self, seconds=OFFBOARD_WARMUP_SEC):
         self.log(f"offboard warmup basladi ({seconds:.1f}s)")
@@ -557,10 +642,10 @@ class PerfectLanderPX4:
 
         while self.running:
             try:
-                vx, vy, vz = self.get_commanded_velocity()
+                vx, vy, vz, yr = self.get_commanded_velocity()
 
                 if self.auto_enabled and not self.manual_override:
-                    self.send_body_velocity(vx, vy, vz)
+                    self.send_body_velocity(vx, vy, vz, yr)
                 elif SEND_ZERO_ON_IDLE:
                     self.send_body_velocity(0.0, 0.0, 0.0)
 
@@ -634,7 +719,12 @@ class PerfectLanderPX4:
             "is_armed": self.is_armed,
             "offboard_requested": self.offboard_requested,
             "fps": float(self.fps),
-            "last_event": self.last_event
+            "last_event": self.last_event,
+            # Precision Landing telemetrisi
+            "precision_land_active": self.precision_land_active,
+            "precision_state": self.precision_state,
+            "fine_mode": self.fine_mode,
+            "corner_count": self.corner_count,
         }
 
         try:
@@ -661,6 +751,22 @@ class PerfectLanderPX4:
         self.marker_detected = False
         self.aruco_altitude = -1.0
         self.last_marker_time = 0.0
+
+        # Precision landing reset
+        self.precision_land_active = False
+        self.precision_state = "IDLE"
+        self.fine_mode = False
+        self.corner_count = 0
+        self.precision_blind = True
+        self.was_landing = False
+        self.traj_active = False
+        self.traj_start_time = 0.0
+        self.traj_start_alt = 0.0
+        self.traj_duration = TRAJ_BASE_DURATION
+        self.last_seen_center_time = 0.0
+        self.last_seen_center_z = 999.0
+        self.precision_last_alt = 999.0
+
         self.set_commanded_velocity(0.0, 0.0, 0.0)
 
     def command_listener_loop(self):
@@ -739,6 +845,22 @@ class PerfectLanderPX4:
                 elif cmd == "POSCTL":
                     self.request_posctl_mode()
 
+                elif cmd == "PRECISION_LAND":
+                    self.log(f"PRECISION_LAND geldi from {addr}")
+                    self.precision_land_active = True
+                    self.precision_state = "SEARCH"
+                    self.precision_blind = True
+                    self.fine_mode = False
+                    self.traj_active = False
+                    self.was_landing = False
+                    self.auto_enabled = True
+                    self.manual_override = False
+                    self.state = "PRECISION_LAND"
+                    # OFFBOARD'a geç (zaten orada değilse)
+                    if self.flight_mode != "OFFBOARD":
+                        self.warmup_offboard_stream()
+                        self.request_offboard_mode()
+
                 else:
                     self.log(f"bilinmeyen komut: {cmd}")
 
@@ -775,6 +897,396 @@ class PerfectLanderPX4:
         return None, corners, ids
 
     # -----------------------------------------------------
+    # PRECISION LANDING: yardımcı metodlar
+    # -----------------------------------------------------
+    def calculate_quintic_trajectory(self, current_time):
+        """5. derece polinom ile yumuşak iniş profili."""
+        t = current_time - self.traj_start_time
+        if t >= self.traj_duration:
+            return 0.0, 0.0
+
+        tau = t / self.traj_duration
+        s_tau = (10 * tau**3) - (15 * tau**4) + (6 * tau**5)
+        v_scale = (30 * tau**2) - (60 * tau**3) + (30 * tau**4)
+
+        total_drop = self.traj_start_alt
+        desired_z = self.traj_start_alt - (total_drop * s_tau)
+        desired_vz = (total_drop * v_scale) / self.traj_duration
+        return desired_z, desired_vz
+
+    def calculate_runway_yaw(self, rvec):
+        """Marker oryantasyonundan yaw hatası hesapla."""
+        R_mat, _ = cv2.Rodrigues(rvec)
+        green_x = R_mat[0][1]
+        green_y = R_mat[1][1]
+        angle_green = math.atan2(green_y, green_x)
+
+        target = -math.pi / 2
+        err = angle_green - target
+        while err > math.pi:
+            err -= 2 * math.pi
+        while err < -math.pi:
+            err += 2 * math.pi
+        return err
+
+    def _center_pixel_from_tvec(self, tvec):
+        """tvec'ten piksel konumuna projeksiyon (pinhole model)."""
+        fx = float(self.camera_matrix[0, 0])
+        fy = float(self.camera_matrix[1, 1])
+        cx = float(self.camera_matrix[0, 2])
+        cy = float(self.camera_matrix[1, 2])
+
+        z = float(tvec[2])
+        if z <= 1e-6:
+            return None, None
+        u = int(fx * (float(tvec[0]) / z) + cx)
+        v = int(fy * (float(tvec[1]) / z) + cy)
+        return u, v
+
+    def detect_all_markers(self, gray):
+        """Tüm ArUco markerları tespit et, her biri için PnP çöz."""
+        if self.new_api:
+            corners, ids, _ = self.detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = aruco.detectMarkers(
+                gray, self.aruco_dict, parameters=self.aruco_params
+            )
+
+        det = {}
+        if ids is None or len(ids) == 0:
+            return det, corners, ids
+
+        ids_flat = ids.flatten()
+        for i, mid in enumerate(ids_flat):
+            mid = int(mid)
+            if mid == TARGET_MARKER_ID:
+                pts = self.marker_points
+            elif mid in CORNER_IDS:
+                pts = self.marker_points_corner
+            else:
+                continue
+
+            c = corners[i][0]
+            tx = int(np.mean(c[:, 0]))
+            ty = int(np.mean(c[:, 1]))
+
+            ok, rvec, tvec = cv2.solvePnP(
+                pts, c, self.camera_matrix, self.dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            if not ok:
+                continue
+
+            det[mid] = {
+                "rvec": rvec,
+                "tvec": tvec.reshape(3),
+                "tx": tx,
+                "ty": ty,
+                "c": c,
+            }
+
+        return det, corners, ids
+
+    # -----------------------------------------------------
+    # PRECISION LANDING: ana kontrol döngüsü
+    # -----------------------------------------------------
+    def precision_land_control(self, frame, dt):
+        """
+        Gelişmiş hassas iniş kontrolcüsü.
+        Return: (out_frame, vx, vy, vz, yaw_rate)
+        """
+        now = time.time()
+        out = frame.copy()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        h, w = frame.shape[:2]
+        img_cx = w // 2
+        img_cy = h // 2
+
+        # Tüm markerları tespit et
+        det, all_corners, all_ids = self.detect_all_markers(gray)
+
+        has0 = (TARGET_MARKER_ID in det)
+        z0 = float(det[TARGET_MARKER_ID]["tvec"][2]) if has0 else self.last_seen_center_z
+
+        # ---- Fine / Coarse mode switching ----
+        if not self.fine_mode:
+            if has0 and (z0 < FINE_ENTER_ALT) and any(cid in det for cid in CORNER_IDS):
+                self.fine_mode = True
+                self.log("FINE MODE: kose markerlar aktif")
+        else:
+            if has0 and (z0 > FINE_EXIT_ALT) and (not self.traj_active):
+                self.fine_mode = False
+                self.log("COARSE MODE: uzaklasildi")
+
+        # ---- Köşelerden platform merkezi kestir ----
+        t_center_from_corners = None
+        rvec_center_ref = None
+        self.corner_count = 0
+
+        if self.fine_mode:
+            centers = []
+            for cid in CORNER_IDS:
+                if cid not in det:
+                    continue
+                rvec_i = det[cid]["rvec"]
+                tvec_i = det[cid]["tvec"]
+                R_i, _ = cv2.Rodrigues(rvec_i)
+                offset_i = self.corner_offsets[cid]
+                t_center_i = (R_i @ offset_i) + tvec_i
+                centers.append(t_center_i)
+                self.corner_count += 1
+                if rvec_center_ref is None:
+                    rvec_center_ref = rvec_i
+
+            if self.corner_count >= 1:
+                t_center_from_corners = np.mean(np.stack(centers, axis=0), axis=0)
+
+        # ---- Aktif ölçüm seçimi (blend / fallback) ----
+        active_tvec = None
+        active_rvec = None
+        active_tx = None
+        active_ty = None
+        active_source = "NONE"
+
+        if not self.fine_mode:
+            if has0:
+                active_tvec = det[TARGET_MARKER_ID]["tvec"]
+                active_tx = det[TARGET_MARKER_ID]["tx"]
+                active_ty = det[TARGET_MARKER_ID]["ty"]
+                active_rvec = det[TARGET_MARKER_ID]["rvec"]
+                active_source = "ID0"
+        else:
+            if has0 and (t_center_from_corners is not None):
+                w_blend = CORNER_BLEND_WEIGHT
+                active_tvec = (1.0 - w_blend) * det[TARGET_MARKER_ID]["tvec"] + w_blend * t_center_from_corners
+                active_tx, active_ty = self._center_pixel_from_tvec(active_tvec)
+                active_rvec = det[TARGET_MARKER_ID]["rvec"]
+                active_source = f"BLEND(0+{self.corner_count})"
+            elif has0:
+                active_tvec = det[TARGET_MARKER_ID]["tvec"]
+                active_tx = det[TARGET_MARKER_ID]["tx"]
+                active_ty = det[TARGET_MARKER_ID]["ty"]
+                active_rvec = det[TARGET_MARKER_ID]["rvec"]
+                active_source = "ID0_ONLY"
+            elif t_center_from_corners is not None:
+                active_tvec = t_center_from_corners
+                active_tx, active_ty = self._center_pixel_from_tvec(active_tvec)
+                active_rvec = rvec_center_ref
+                active_source = f"CORNERS({self.corner_count})"
+
+        # Projeksiyon hatası kontrolü
+        if active_tvec is not None and (active_tx is None or active_ty is None):
+            active_tvec = None
+
+        vx_local = 0.0
+        vy_local = 0.0
+        vz = 0.0
+        yaw_rate_cmd = 0.0
+
+        if active_tvec is not None:
+            self.marker_detected = True
+            self.last_marker_time = now
+
+            self.aruco_altitude = float(active_tvec[2])
+            self.precision_last_alt = self.aruco_altitude
+            if has0:
+                self.last_seen_center_time = now
+                self.last_seen_center_z = float(det[TARGET_MARKER_ID]["tvec"][2])
+
+            tx = int(active_tx)
+            ty = int(active_ty)
+
+            err_forward = img_cx - tx
+            err_right = img_cy - ty
+
+            if REVERSE_X:
+                err_forward *= -1
+            if REVERSE_Y:
+                err_right *= -1
+
+            self.err_x = err_forward
+            self.err_y = err_right
+            dist_pixel = math.sqrt(err_forward ** 2 + err_right ** 2)
+
+            # Yaw hatası
+            yaw_err = self.calculate_runway_yaw(active_rvec)
+            yaw_rate_cmd = float(np.clip(yaw_err * KP_YAW, -1.0, 1.0))
+
+            # Lock mode aktif mi?
+            lock_active = (self.aruco_altitude < LOCK_ALT_M)
+
+            # PID kazançları (lock modunda artırılmış)
+            kp_eff = KP
+            ki_eff = KI
+            kd_eff = KD
+            if lock_active:
+                kp_eff *= LOCK_KP_MULT
+                kd_eff *= LOCK_KD_MULT
+                if LOCK_DISABLE_INTEGRAL:
+                    ki_eff = 0.0
+
+            # İlk yakalama
+            if self.precision_blind:
+                self.log(f"PRECISION: hedef yakalandi, source={active_source}")
+                self.precision_blind = False
+                self.prev_err_x = err_forward
+                self.prev_err_y = err_right
+                self.integral_x = 0.0
+                self.integral_y = 0.0
+
+                if self.was_landing:
+                    self.log(f"PRECISION: inise devam, alt={self.aruco_altitude:.2f}m")
+                    self.traj_active = True
+                    self.traj_start_time = now
+                    self.traj_start_alt = self.aruco_altitude
+                    scale = float(np.clip(self.aruco_altitude / 2.0, 0.4, 1.0))
+                    self.traj_duration = TRAJ_BASE_DURATION * scale
+
+            # Precision state güncelle
+            mode_txt = "FINE" if self.fine_mode else "COARSE"
+            self.precision_state = f"{mode_txt}:{active_source}"
+
+            # ---- GÖRSEL KILL ----
+            if self.aruco_altitude < PRECISION_KILL_ALT and dist_pixel < PRECISION_KILL_DIST:
+                self.log("PRECISION: gorsel temas -> FORCE DISARM")
+                self.precision_state = "KILL"
+                self.state = "PRECISION_DONE"
+                self.force_disarm()
+                return out, 0.0, 0.0, 0.0, 0.0
+
+            # ---- PID ----
+            p_x = err_forward * kp_eff
+            p_y = err_right * kp_eff
+
+            if dist_pixel < 200:
+                self.integral_x += err_forward * dt
+                self.integral_y += err_right * dt
+            else:
+                self.integral_x = 0.0
+                self.integral_y = 0.0
+
+            self.integral_x = clamp(self.integral_x, -200, 200)
+            self.integral_y = clamp(self.integral_y, -200, 200)
+
+            d_x = (err_forward - self.prev_err_x) / dt
+            d_y = (err_right - self.prev_err_y) / dt
+            self.prev_err_x = err_forward
+            self.prev_err_y = err_right
+
+            pid_x = p_x + (self.integral_x * ki_eff) + (d_x * kd_eff)
+            pid_y = p_y + (self.integral_y * ki_eff) + (d_y * kd_eff)
+
+            vx_body = float(np.clip(pid_x, -self.max_vel_precision, self.max_vel_precision))
+            vy_body = float(np.clip(pid_y, -self.max_vel_precision, self.max_vel_precision))
+
+            # Velocity taper
+            base = TAPER_BASE_FAR
+            min_scale = TAPER_MIN_FAR
+            if self.aruco_altitude < LOCK_ALT_M:
+                base = TAPER_BASE_NEAR
+                min_scale = TAPER_MIN_NEAR
+
+            taper_scale = float(np.clip(dist_pixel / base, min_scale, 1.0))
+            vx_body *= taper_scale
+            vy_body *= taper_scale
+
+            # Body -> Local (yaw rotasyonu)
+            cos_y = math.cos(self.current_yaw)
+            sin_y = math.sin(self.current_yaw)
+            vx_local = vx_body * cos_y - vy_body * sin_y
+            vy_local = vx_body * sin_y + vy_body * cos_y
+
+            # ---- Yörünge başlatma ----
+            start_cond = ((dist_pixel < 100) and (abs(yaw_err) < 0.3)) or (self.aruco_altitude < 1.0)
+            if not self.traj_active and start_cond:
+                self.traj_active = True
+                self.was_landing = True
+                self.traj_start_time = now
+                self.traj_start_alt = self.aruco_altitude
+                self.traj_duration = TRAJ_BASE_DURATION
+                self.log("PRECISION: inis rotasi basladi")
+
+            # ---- Z kontrolü ----
+            if self.traj_active:
+                desired_z, feed_forward_vz = self.calculate_quintic_trajectory(now)
+                z_error = self.aruco_altitude - desired_z
+                vz = float(np.clip(feed_forward_vz + (z_error * 1.5), -0.5, 0.8))
+            else:
+                vz = 0.0
+
+            # ---- Lock mode gating ----
+            if lock_active and self.traj_active:
+                lock_good = (dist_pixel < LOCK_ENTER_PX) and (abs(yaw_err) < LOCK_YAW_ENTER)
+                lock_bad = (dist_pixel > LOCK_EXIT_PX) or (abs(yaw_err) > LOCK_YAW_EXIT)
+
+                if lock_bad:
+                    vz = 0.0
+                    self.precision_state += "|HOLD_Z"
+                elif lock_good:
+                    vz = float(np.clip(vz, -0.2, LOCK_VZ_DOWN))
+                    self.precision_state += "|LOCK_OK"
+
+            # ---- Görsel overlay ----
+            if all_ids is not None:
+                aruco.drawDetectedMarkers(out, all_corners, all_ids)
+
+            if has0:
+                cv2.drawFrameAxes(out, self.camera_matrix, self.dist_coeffs,
+                                  det[TARGET_MARKER_ID]["rvec"],
+                                  det[TARGET_MARKER_ID]["tvec"].reshape(3, 1), 0.15)
+
+            cv2.line(out, (img_cx, img_cy), (tx, ty), (255, 0, 0), 2)
+            cv2.circle(out, (img_cx, img_cy), 5, (0, 255, 0), -1)
+            cv2.circle(out, (tx, ty), 5, (0, 0, 255), -1)
+
+            cv2.putText(out, f"PREC: {self.precision_state}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(out, f"Alt: {self.aruco_altitude:.2f}m  corners:{self.corner_count}", (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            landing_txt = "LANDING" if self.traj_active else "ALIGNING"
+            cv2.putText(out, landing_txt, (10, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if self.traj_active else (0, 255, 255), 2)
+            cv2.putText(out, f"vx={vx_local:.2f} vy={vy_local:.2f} vz={vz:.2f}", (10, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+        else:
+            # Marker kayboldu
+            self.marker_detected = False
+            self.err_x = 0.0
+            self.err_y = 0.0
+
+            if not self.precision_blind:
+                self.log(f"PRECISION: marker kayboldu! Son alt={self.precision_last_alt:.2f}m")
+                self.precision_blind = True
+
+                # Kör nokta inişi kontrolü
+                if self.was_landing and self.precision_last_alt < BLIND_KILL_ALT:
+                    self.log("PRECISION: kor nokta inisi -> FORCE DISARM")
+                    self.precision_state = "BLIND_KILL"
+                    self.state = "PRECISION_DONE"
+                    self.force_disarm()
+                    return out, 0.0, 0.0, 0.0, 0.0
+
+                if self.traj_active:
+                    self.traj_active = False
+                    self.log("PRECISION: yorunge duraklatildi")
+
+            self.integral_x = 0.0
+            self.integral_y = 0.0
+            self.precision_state = "SEARCH"
+
+            cv2.putText(out, "PRECISION: MARKER ARANIYOR...", (10, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            vx_local = 0.0
+            vy_local = 0.0
+            vz = 0.0
+            yaw_rate_cmd = 0.0
+
+        return out, vx_local, vy_local, vz, yaw_rate_cmd
+
+    # -----------------------------------------------------
     # kontrol
     # -----------------------------------------------------
     def process_frame_and_control(self, frame):
@@ -785,6 +1297,10 @@ class PerfectLanderPX4:
             dt = 0.02
         if dt > 0.1:
             dt = 0.1
+
+        # ---- Precision mode delegasyonu ----
+        if self.precision_land_active:
+            return self.precision_land_control(frame, dt)
 
         out = frame.copy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -857,7 +1373,7 @@ class PerfectLanderPX4:
 
             if not self.auto_enabled or self.manual_override:
                 self.state = "MANUAL" if self.manual_override else "IDLE"
-                return out, 0.0, 0.0, 0.0
+                return out, 0.0, 0.0, 0.0, 0.0
 
             self.integral_x += err_x * dt
             self.integral_y += err_y * dt
@@ -906,7 +1422,7 @@ class PerfectLanderPX4:
             cv2.putText(out, f"vx={vx_cmd:.2f} vy={vy_cmd:.2f} vz={vz_cmd:.2f}", (10, 210),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-            return out, vx_cmd, vy_cmd, vz_cmd
+            return out, vx_cmd, vy_cmd, vz_cmd, 0.0
 
         else:
             if self.auto_enabled and not self.manual_override:
@@ -922,7 +1438,7 @@ class PerfectLanderPX4:
             cv2.putText(out, f"mode={self.flight_mode}", (10, 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            return out, 0.0, 0.0, 0.0
+            return out, 0.0, 0.0, 0.0, 0.0
 
     # -----------------------------------------------------
     # ana loop
@@ -937,14 +1453,17 @@ class PerfectLanderPX4:
                 time.sleep(0.02)
                 continue
 
-            processed, vx, vy, vz = self.process_frame_and_control(frame)
+            processed, vx, vy, vz, yr = self.process_frame_and_control(frame)
 
             if self.auto_enabled and not self.manual_override:
-                if (time.time() - self.last_marker_time) > MARKER_LOST_TIMEOUT:
-                    vx, vy, vz = 0.0, 0.0, 0.0
-                    self.state = "SEARCH"
+                if not self.precision_land_active:
+                    # Precision modda marker kaybi zaten içerde yönetiliyor
+                    if (time.time() - self.last_marker_time) > MARKER_LOST_TIMEOUT:
+                        vx, vy, vz, yr = 0.0, 0.0, 0.0, 0.0
+                        if not self.precision_land_active:
+                            self.state = "SEARCH"
 
-            self.set_commanded_velocity(vx, vy, vz)
+            self.set_commanded_velocity(vx, vy, vz, yr)
 
             self._fps_counter += 1
             if time.time() - self._fps_last_t >= 1.0:
